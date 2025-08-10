@@ -42,6 +42,9 @@ kind delete cluster --name istio-testing
 
 # Run tests
 ./mvnw test
+
+# Build native image
+./mvnw -Pnative spring-boot:build-image
 ```
 
 ### Istio Operations

@@ -1,0 +1,135 @@
+---
+# Enhanced AuthorizationPolicy for book-info service with mTLS + JWT dual authentication
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: book-info-enhanced-auth
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: book-info
+  action: ALLOW
+  rules:
+  # Rule 1: Allow access to /getbooks with valid JWT from authenticated services
+  - from:
+    # - source:
+    #     principals: ["cluster.local/ns/default/sa/greeting-service"]
+    # - source:
+    #     requestPrincipals: ["*"]
+  # Rule 2: Allow access to /addbook only for admin role with both mTLS and JWT
+    - source:
+        principals: ["cluster.local/ns/default/sa/greeting-service"]
+        requestPrincipals: ["*"]
+    to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/getbooks", "/getbookbytitle*"]
+    when:
+    - key: request.auth.claims[azp]
+      values: ["client", "api-client"]
+  
+  # Rule 2: Allow access to /addbook only for admin role with both mTLS and JWT
+  - from:
+    - source:
+        principals: ["cluster.local/ns/default/sa/greeting-service"]
+        requestPrincipals: ["*"]
+    to:
+    - operation:
+        methods: ["POST"]
+        paths: ["/addbook*"]
+    when:
+    - key: request.auth.claims[realm_access][roles]
+      values: ["admin"]
+    - key: request.auth.claims[azp]
+      values: ["client", "api-client"]
+  
+  # Rule 3: Allow health checks without authentication (for monitoring)
+  - to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/health", "/healthz", "/actuator/health"]
+
+---
+# # AuthorizationPolicy for greeting-service
+# apiVersion: security.istio.io/v1
+# kind: AuthorizationPolicy
+# metadata:
+#   name: greeting-service-auth
+#   namespace: default
+# spec:
+#   selector:
+#     matchLabels:
+#       app: greeting-service
+#   action: ALLOW
+#   rules:
+#   # Allow public access to greeting endpoint
+#   - to:
+#     - operation:
+#         methods: ["GET"]
+#         paths: ["/greeting"]
+  
+#   # Allow health checks
+#   - to:
+#     - operation:
+#         methods: ["GET"]
+#         paths: ["/actuator/*", "/health", "/healthz"]
+
+# ---
+# Default DENY policy to prevent unauthorized access
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all-default
+  namespace: default
+spec:
+  action: DENY
+  rules:
+  # Deny access to sensitive internal endpoints on HTTP ports
+  - to:
+    - operation:
+        ports: ["80", "8080"]
+        paths: ["/internal/*", "/admin/*", "/management/*"]
+  
+  # Deny direct access to services without proper authentication on HTTP ports
+  - from:
+    - source:
+        notPrincipals: ["cluster.local/ns/default/sa/greeting-service"]
+    to:
+    - operation:
+        ports: ["80", "8080"]
+        methods: ["POST", "PUT", "DELETE"]
+    when:
+    - key: request.auth.claims[aud]
+      notValues: ["client", "api-client"]
+
+---
+# # Anti-lateral movement policy to prevent service compromise propagation
+# apiVersion: security.istio.io/v1
+# kind: AuthorizationPolicy
+# metadata:
+#   name: anti-lateral-movement
+#   namespace: default
+# spec:
+#   action: DENY
+#   rules:
+#   # Block suspicious cross-service access patterns
+#   - from:
+#     - source:
+#         principals: ["cluster.local/ns/default/sa/greeting-service"]
+#     to:
+#     - operation:
+#         paths: ["/addbook*", "/admin/*", "/internal/*"]
+#     when:
+#     - key: request.auth.claims[realm_access][roles]
+#       notValues: ["admin"]
+  
+#   # Block high-frequency requests that might indicate compromise
+#   - when:
+#     - key: request.headers[x-request-rate]
+#       values: ["high", "suspicious"]
+  
+#   # Block requests with suspicious JWT claims
+#   - when:
+#     - key: request.auth.claims[sub]
+#       values: ["suspicious-*", "test-*", "debug-*"]

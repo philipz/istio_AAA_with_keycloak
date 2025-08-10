@@ -12,7 +12,7 @@ spec:
   jwtRules:
   - issuer: "http://keycloak.172.19.0.6.nip.io/realms/Istio"
     jwksUri: "http://keycloak.172.19.0.6.nip.io/realms/Istio/protocol/openid-connect/certs"
-    audiences: ["client", "api-client"]
+    audiences: ["client", "api-client"] #需要參考如何在 Keycloak 中配置aud
     forwardOriginalToken: true
 ---
 # # RequestAuthentication for greeting-service (if it needs to validate incoming JWTs)
