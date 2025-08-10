@@ -38,7 +38,7 @@ kind delete cluster --name istio-testing
 ./mvnw clean package
 
 # Run application locally
-./mvnw spring-boot:run
+./mvnw spring-boot:run -Dspring-boot.run.profiles=dev
 
 # Run tests
 ./mvnw test
