@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: greeting
-          image: rest-service:0.0.1-SNAPSHOT
+          image: philipz/rest-service:0.0.1-SNAPSHOT
           ports:
             - containerPort: 8080
             - containerPort: 9000
