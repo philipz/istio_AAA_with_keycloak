@@ -2,7 +2,9 @@
 
 ## 概述
 
-在 Istio 架構下實現 Machine to Machine (M2M) 的 API 權限管制，主要結合身份認證、授權策略和相互 TLS 來確保 API 的安全訪問。
+本文檔描述了在 Istio 服務網格中實現 Machine to Machine (M2M) API 權限管制的完整設計方案。基於本專案的實際實施經驗，結合身份認證、授權策略和相互 TLS 來確保 API 的安全訪問。
+
+**專案背景**: 本專案基於 Spring Boot 3.5.4 + Istio + Keycloak，實現了圖書管理系統的 M2M 安全架構，包含 mTLS + JWT 雙重認證機制。
 
 ## 1. 身份認證 (Authentication)
 
@@ -299,6 +301,122 @@ spec:
    - 檢查 RBAC 配置
    - 驗證命名空間權限
 
-這個架構提供了完整的 M2M API 權限管制解決方案，結合了 Istio 的身份認證、授權和相互 TLS 功能，確保 API 的安全訪問。
+## 9. 專案實際配置範例
 
-[About Aud](https://dev.to/metacosmos/how-to-configure-audience-in-keycloak-kp4)
+基於本專案的實際實施，以下是關鍵配置文件：
+
+### RequestAuthentication 配置
+
+```yaml
+# PeerAuthentication/request-authentication-enhanced.yaml
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: book-info-request-authentication
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: book-info
+  jwtRules:
+  - issuer: "http://keycloak.172.19.0.6.nip.io/realms/Istio"
+    jwksUri: "http://keycloak.172.19.0.6.nip.io/realms/Istio/protocol/openid-connect/certs"
+    audiences: ["client", "api-client"]  # 詳見 JWT Audiences 最佳實踐
+    forwardOriginalToken: true
+```
+
+### AuthorizationPolicy 配置
+
+```yaml
+# authorization-policy-enhanced.yaml (mTLS + JWT 雙重認證)
+- from:
+  - source:
+      principals: ["cluster.local/ns/default/sa/greeting-service"]  # mTLS 身份
+      requestPrincipals: ["*"]                                     # JWT 認證
+  to:
+  - operation:
+      methods: ["GET"]
+      paths: ["/getbooks", "/getbookbytitle*"]
+  when:
+  - key: request.auth.claims[azp]
+    values: ["client", "api-client"]
+```
+
+### ServiceAccount 配置
+
+```yaml
+# greeting-service-account.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: greeting-service
+  namespace: default
+  labels:
+    app: greeting
+```
+
+### Spring Boot 配置
+
+```properties
+# src/main/resources/application.properties
+management.server.port=9000  # Actuator 分離至獨立端口
+spring.security.oauth2.client.provider.keycloak.issuer-uri=http://keycloak.172.19.0.6.nip.io/realms/Istio
+```
+
+## 10. JWT Audiences 最佳實踐
+
+### Audiences 參數重要性
+
+JWT 中的 `audiences` 參數是關鍵的安全控制機制：
+
+```yaml
+audiences: ["client", "api-client"]
+```
+
+**用途**:
+- 確保 JWT token 只能用於指定的接收者
+- 防止 token 在不同服務間的濫用
+- 實現服務間的 token 隔離
+
+**如果省略 audiences 的風險**:
+- 任何來自同一 Issuer 的有效 JWT 都會被接受
+- 失去服務間的 token 邊界控制
+- 增加橫向攻擊的風險
+
+## 11. 已知問題與解決方案
+
+### OR 邏輯安全漏洞
+
+**問題**: AuthorizationPolicy 中的 OR 邏輯可能導致安全漏洞
+
+```yaml
+# ❌ 錯誤配置 - OR 邏輯
+- from:
+  - source:
+      principals: ["cluster.local/ns/default/sa/greeting-service"]  # 條件 A
+  - source:
+      requestPrincipals: ["*"]                                     # 條件 B
+```
+
+**解決方案**: 使用 AND 邏輯
+
+```yaml
+# ✅ 正確配置 - AND 邏輯
+- from:
+  - source:
+      principals: ["cluster.local/ns/default/sa/greeting-service"]  # mTLS + JWT
+      requestPrincipals: ["*"]
+```
+
+### Spring Boot Actuator 配置衝突
+
+**問題**: Actuator 端點被 OAuth2 安全配置阻擋
+**解決方案**: 分離 Actuator 到獨立端口 (9000)
+
+這個架構提供了完整且經過實戰驗證的 M2M API 權限管制解決方案，結合了 Istio 的身份認證、授權和相互 TLS 功能，確保 API 的安全訪問。
+
+## 延伸閱讀
+
+- [如何在 Keycloak 中配置 aud](https://dev.to/metacosmos/how-to-configure-audience-in-keycloak-kp4)
+- [Istio mTLS + JWT 雙重認證分析](./mTLS_JWT.md)
+- [專案實施指南](./guide.md)

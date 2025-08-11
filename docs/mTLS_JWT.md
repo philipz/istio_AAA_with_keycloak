@@ -300,5 +300,111 @@ mTLS + JWT 雙重認證是 Istio 服務網格中實現深度防禦的關鍵策�
 通過遵循這些最佳實踐，可以構建一個真正安全、可審計的服務間通信架構。
 
 
+## JWT Audiences 深入分析
+
+### 什麼是 JWT Audiences
+
+JWT 中的 `audiences` (aud) 參數用於標識 token 的**預期接收者**，是 JWT 規範 (RFC 7519) 中的標準聲明。
+
+在本專案的配置中：
+```yaml
+audiences: ["client", "api-client"]  # 需要參考如何在 Keycloak 中配置aud
+```
+
+### 安全重要性
+
+1. **Token 專用性驗證**: 確保 JWT token 只能用於指定的接收者
+2. **API 邊界控制**: 限制 token 只能用於特定的 API 端點或服務群組
+3. **橫向攻擊防護**: 防止為其他服務發放的 JWT 被用於訪問 book-info 服務
+
+### 缺少 Audiences 的風險
+
+如果在 RequestAuthentication 中省略 `audiences` 參數：
+
+```yaml
+# 不安全的配置
+jwtRules:
+- issuer: "http://keycloak.172.19.0.6.nip.io/realms/Istio"
+  jwksUri: "http://keycloak.172.19.0.6.nip.io/realms/Istio/protocol/openid-connect/certs"
+  # 沒有 audiences 驗證
+```
+
+**安全風險**:
+1. **Token 濫用**: 任何來自同一 Issuer 的有效 JWT 都會被接受
+2. **權限邊界模糊**: 失去服務間的 token 隔離
+3. **橫向攻擊**: 攻擊者可以使用為其他應用發放的 token 訪問當前服務
+
+### 測試驗證
+
+```bash
+# 測試正確的 audience
+curl -H "Authorization: Bearer $TOKEN_WITH_CORRECT_AUD" \
+     "http://book-info/getbooks"
+# 預期：成功
+
+# 測試錯誤的 audience  
+curl -H "Authorization: Bearer $TOKEN_WITH_WRONG_AUD" \
+     "http://book-info/getbooks"
+# 預期：403 Forbidden
+
+# 測試無 audience 的 token
+curl -H "Authorization: Bearer $TOKEN_WITHOUT_AUD" \
+     "http://book-info/getbooks"  
+# 預期：403 Forbidden（如果配置了 audience 驗證）
+```
+
+## 專案實施總結
+
+本專案通過以下關鍵配置實現了真正的 mTLS + JWT 雙重認證：
+
+### 核心安全配置
+
+1. **mTLS 強制模式**：
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+spec:
+  mtls:
+    mode: STRICT
+```
+
+2. **JWT 驗證配置**：
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+spec:
+  jwtRules:
+  - issuer: "http://keycloak.172.19.0.6.nip.io/realms/Istio"
+    audiences: ["client", "api-client"]  # 關鍵安全控制
+```
+
+3. **AND 邏輯授權策略**：
+```yaml
+- from:
+  - source:
+      principals: ["cluster.local/ns/default/sa/greeting-service"]  # mTLS
+      requestPrincipals: ["*"]                                     # JWT
+```
+
+### 解決的關鍵問題
+
+1. **OR 邏輯安全漏洞**: 修正為 AND 邏輯確保雙重認證
+2. **ServiceAccount 管理**: 建立專用 SA 並確保名稱一致
+3. **Spring Boot 配置衝突**: Actuator 端口分離避免 OAuth2 衝突
+4. **JWT Audiences 控制**: 實現服務間 token 隔離
+
+### 性能優化特性
+
+- **GraalVM Native Image**: 支持更輕量的容器鏡像
+- **Spring Boot 3.5.4**: 最新版本性能優化
+- **端口分離**: Actuator (9000) 與應用 (8080) 端口分離
+
 ## 延伸閱讀
-* [如何在 Keycloak 中配置aud](https://dev.to/metacosmos/how-to-configure-audience-in-keycloak-kp4)
+
+* [如何在 Keycloak 中配置 aud](https://dev.to/metacosmos/how-to-configure-audience-in-keycloak-kp4)
+* [Istio M2M API 權限管制設計](./istio_m2m.md)
+* [Istio 服務網格安全防護指南](./guide.md)
+* [GraalVM Native Image 官方文檔](https://www.graalvm.org/latest/reference-manual/native-image/)
+* [Spring Boot 3.5.4 發布說明](https://github.com/spring-projects/spring-boot/releases)

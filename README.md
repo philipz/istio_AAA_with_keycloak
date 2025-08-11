@@ -314,7 +314,7 @@ kubectl apply -f keycloak/keycloak-gateway.yaml
 
 ![](docs/images/keycloak5.png)
 
-  ```
+  ```sh
   curl -X POST -d "client_id=Istio" -d "username=book-user" -d "password=YOUR_PASSWD" -d "grant_type=password" "http://keycloak.172.19.0.6.nip.io/realms/Istio/protocol/openid-connect/token"
   {"error":"invalid_grant","error_description":"Account is not fully set up"}% 
   ```
@@ -338,7 +338,7 @@ kubectl apply -f keycloak/keycloak-gateway.yaml
 
 ![](docs/images/keycloak7.png)
 
-### Istio request level authentication and authorizationIstio 請求等級身份驗證和授權
+### Istio request level 身份驗證和授權
 
 我們已經運行了一個範例 book-info 應用，並配置了 Keycloak 來頒發 JWT 令牌。現在，我們可以使用 Istio 的 RequestAuthentication 和 Authorization 策略來驗證 JWT 令牌並授權存取請求。
 
@@ -536,6 +536,471 @@ Istio 的請求身份驗證和授權功能與 Keycloak 一起為您的應用程�
 - 選擇適合您要求的身份驗證提供程序，並始終使用帶有 OpenID Connect 的 OAuth2 進行請求級別身份驗證。
 - 確保為不同的 API 端點使用不同的權限/角色。您可以在身分驗證提供者中建立一組權限和角色，並使用它們對應用程式 API 端點進行細粒度的存取控制。
 - 確定何時使用請求層級的身份驗證和授權。您無需對每個請求都進行身份驗證和授權。您的應用程式可能包含一些需要公開存取的 API 端點，例如 /healthz、/ping 或 /public，因此請謹慎選擇要保護的端點。
+
+# 進階 Istio 服務網格 mTLS + JWT 雙重認證模式安全防護
+
+基於本專案的實際實施經驗，描述了在 Istio 平台中採用 **mTLS + JWT 雙重認證模式** 的完整安全架構，這是目前在 Istio 中防止惡意程式入侵擴散最有效的深度防禦策略。
+
+## 🏗️ 專案架構概述
+
+```
+┌─────────────────┐    mTLS+JWT    ┌─────────────────┐    mTLS+JWT    ┌─────────────────┐
+│   Client Apps   │ ──────────────→│  Istio Gateway  │──────────────→│ Greeting Service│
+└─────────────────┘                └─────────────────┘                │  (REST API)     │
+                                            │                        └─────────────────┘
+                                            │                                 │
+                                            ▼                                 │ mTLS+JWT
+                                   ┌─────────────────┐                        │
+                                   │    Keycloak     │                        ▼
+                                   │  (JWT Issuer)   │                ┌─────────────────┐
+                                   └─────────────────┘                │   Book Service  │
+                                                                      │  (Backend API)  │
+                                                                      └─────────────────┘
+                                                                              │
+                                                                              ▼
+                                                                      ┌─────────────────┐
+                                                                      │   MySQL DB      │
+                                                                      │  (Data Store)   │
+                                                                      └─────────────────┘
+```
+
+**服務調用流程**：
+1. **Client → Gateway**: 用戶端可直接或透過 JWT token 請求 Greeting Service
+2. **Gateway → Greeting**: Istio Gateway 路由請求到 Greeting Service (REST API 層)
+3. **Greeting → Book**: Greeting Service 透過 mTLS + JWT 雙重認證調用 Book Service
+4. **Book → MySQL**: Book Service 處理業務邏輯並存取資料庫
+
+**專案實施背景**：
+- **架構**: Spring Boot 3.5.4 + Istio Service Mesh + Keycloak + Kind Kubernetes
+- **應用場景**: book-info系統的請求級身份驗證與授權
+- **核心特性**: mTLS + JWT 雙重認證、細粒度授權策略、GraalVM Native Image 支持
+- **安全特色**: 防入侵橫向擴散、Spring Boot Actuator 端口分離、JWT Audiences 控制
+
+## 推薦方案：mTLS + JWT 雙重認證架構
+
+### 核心設計原理
+
+**第一層防護：mTLS基礎身份驗證**
+Istio自動將所有代理間的流量升級為相互TLS，確保服務間通訊的基礎安全。
+
+**第二層防護：JWT應用層授權**
+JWT認證可以與mTLS認證結合使用，當JWT用作代表終端調用者的憑證，且被請求的服務需要證明它是代表終端調用者被調用時，採用Client Credentials Flow。
+
+### 1. 強制 mTLS 模式步驟
+
+全面啟用mTLS雙向加密，內容為PeerAuthentication/peer-authentication.yaml。
+
+```yaml
+# Global STRICT mTLS for all services in the mesh
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  mtls:
+    mode: STRICT
+---
+# Namespace-specific mTLS for default namespace (optional, inherits from global)
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: default
+spec:
+  mtls:
+    mode: STRICT
+```
+
+先執行 verify-mtls.sh 來確認目前加密狀況：
+```sh
+❯ ./PeerAuthentication/verify-mtls.sh
+
+==================================
+    Istio mTLS 驗證腳本
+==================================
+
+[INFO] 檢查先決條件...
+[SUCCESS] 先決條件檢查通過
+
+[INFO] 檢查 PeerAuthentication 政策...
+[INFO] 檢查全域 PeerAuthentication...
+[ERROR] 全域 PeerAuthentication 未找到
+[ERROR] 沒有 PeerAuthentication 政策時，Istio 預設允許明文通信
+[INFO] 檢查 default namespace PeerAuthentication...
+[WARNING] default namespace PeerAuthentication 未設定，且無全域政策
+[INFO] PeerAuthentication 政策摘要:
+  - 全域政策: false (模式: N/A)
+  - default namespace 政策: false (模式: N/A)
+  - 整體 mTLS 狀態: NONE
+...
+[INFO] 生成 mTLS 驗證摘要報告...
+
+==================================
+       mTLS 驗證摘要報告
+==================================
+
+📊 mTLS 狀態概覽：
+  ├─ 整體狀態: NONE
+  ├─ 預期行為: 僅允許明文連接（無加密）
+  ├─ 全域政策: false (N/A)
+  └─ default NS 政策: false (N/A)
+
+🚨 安全性評估: 不足
+   ❌ 缺少 mTLS 保護
+   ❌ 服務間通信未加密
+   🚨 風險：可能遭受中間人攻擊
+
+🔧 立即行動項目：
+   1. 部署 PeerAuthentication 政策
+   2. 確保所有 pod 注入 Istio sidecar
+   3. 測試應用程式與 mTLS 的兼容性
+
+📋 檢查項目:
+  ✓ 先決條件檢查
+  ✓ PeerAuthentication 政策分析
+  ✓ Istio proxy 狀態檢查
+  ✓ mTLS 配置驗證
+  ✓ 連接行為測試
+  ✓ 證書狀態檢查
+
+💡 建議事項：
+  • 🚨 緊急：立即部署 PeerAuthentication
+  • 確認所有服務注入 Istio sidecar
+  • 規劃 mTLS 啟用策略
+  • 確保所有服務都已注入 Istio sidecar
+  • 監控 Istio proxy 狀態確保配置同步
+  • 定期檢查證書的有效期
+
+詳細信息請參考上方的檢查輸出
+[ERROR] mTLS 驗證完成！狀態：無保護 (安全性不足)
+[ERROR] 緊急：需要部署 PeerAuthentication 政策
+[INFO] 清理測試資源...
+[SUCCESS] 測試資源已清理
+```
+
+啟用Istio mTLS雙向加密網：
+
+```sh
+kubectl apply -f PeerAuthentication/peer-authentication.yaml
+```
+
+再次執行 verify-mtls.sh 來確認目前加密狀況：
+```sh
+❯ ./PeerAuthentication/verify-mtls.sh
+
+==================================
+    Istio mTLS 驗證腳本
+==================================
+
+[INFO] 檢查先決條件...
+[SUCCESS] 先決條件檢查通過
+
+[INFO] 檢查 PeerAuthentication 政策...
+[INFO] 檢查全域 PeerAuthentication...
+[SUCCESS] 全域 PeerAuthentication 存在，模式: STRICT
+[SUCCESS] 全域 mTLS 設定為 STRICT 模式
+[INFO] 檢查 default namespace PeerAuthentication...
+[SUCCESS] default namespace PeerAuthentication 存在，模式: STRICT
+[INFO] PeerAuthentication 政策摘要:
+  - 全域政策: true (模式: STRICT)
+  - default namespace 政策: true (模式: STRICT)
+  - 整體 mTLS 狀態: STRICT
+
+[INFO] 檢查 Istio proxy 狀態..
+...
+[INFO] 生成 mTLS 驗證摘要報告...
+
+==================================
+       mTLS 驗證摘要報告
+==================================
+
+📊 mTLS 狀態概覽：
+  ├─ 整體狀態: STRICT
+  ├─ 預期行為: 僅允許 mTLS 加密連接
+  ├─ 全域政策: true (STRICT)
+  └─ default NS 政策: true (STRICT)
+
+🔐 安全性評估: 優秀
+   ✅ 所有服務間通信都使用 mTLS 加密
+   ✅ 阻止未授權的明文連接
+   ✅ 符合零信任安全原則
+
+📋 檢查項目:
+  ✓ 先決條件檢查
+  ✓ PeerAuthentication 政策分析
+  ✓ Istio proxy 狀態檢查
+  ✓ mTLS 配置驗證
+  ✓ 連接行為測試
+  ✓ 證書狀態檢查
+
+💡 建議事項：
+  • 定期監控 proxy 同步狀態
+  • 驗證新部署服務的 mTLS 兼容性
+  • 定期檢查證書輪換
+  • 確保所有服務都已注入 Istio sidecar
+  • 監控 Istio proxy 狀態確保配置同步
+  • 定期檢查證書的有效期
+
+詳細信息請參考上方的檢查輸出
+[SUCCESS] mTLS 驗證完成！狀態：STRICT (安全性優秀)
+[INFO] 清理測試資源...
+[SUCCESS] 測試資源已清理
+```
+
+### 2. 導入微服務 OAuth2 JWT應用層授權
+
+部署rest-service，來呼叫book-info的/getbooks API，而目前需要使用JWT Token才能存取。
+在 *GreetingController.java* 中實作 Greeting Service → Book Service 的程式，並且透過 *OAuth2Config.java* 採用 spring-boot-starter-oauth2-client 套件，自動取得JWT Token。
+
+並且在 *application.properties*，加上client-id和client-secret，這在[Keycloak Client Credentials Flow](#keycloak-client-credentials-flow)步驟已有設定，請複製Credentials貼到client-secret。
+
+```
+# OAuth2 Client Credentials configuration for Keycloak
+spring.security.oauth2.client.registration.keycloak.client-id=client
+spring.security.oauth2.client.registration.keycloak.client-secret=G1ubsAhCLcwKNgE6J7oGOQtj6kRWZsYm
+spring.security.oauth2.client.registration.keycloak.authorization-grant-type=client_credentials
+spring.security.oauth2.client.registration.keycloak.scope=openid
+```
+
+部署rest-service程式：
+
+```sh
+❯ kubectl apply -f PeerAuthentication/greeting-service.yml
+deployment.apps/greeting-deployment created
+service/greeting-service created
+gateway.networking.istio.io/greeting-gateway created
+virtualservice.networking.istio.io/greeting-vs created
+```
+
+確認部署完成且可正常運作：
+
+```sh
+curl -X GET http://greeting.172.19.0.6.nip.io/
+welcome v2%
+```
+
+接著驗證 Greeting Service → Book Service 是否正常運作，呼叫/greeting API：
+
+```sh
+❯ curl -X GET http://greeting.172.19.0.6.nip.io/greeting
+{"id":1,"content":"Hello, authenticated Member! We have 3 books available for you."}%
+```
+
+結果顯示取得三本書籍，表示Client Credentials Flow已經正常，直接呼叫 book-info /getbooks則出現 access denied錯誤：
+```sh
+curl -X GET http://book-info.172.19.0.6.nip.io/getbooks
+RBAC: access denied%
+```
+
+#### 啟用增強式請求身份驗證
+
+原先[請求身份驗證](#%E5%95%9F%E7%94%A8%E8%AB%8B%E6%B1%82%E8%BA%AB%E4%BB%BD%E9%A9%97%E8%AD%89)，並沒有指定audiences: ["client", "api-client"]，而PeerAuthentication/request-authentication-enhanced.yaml則有指定，內容如下：
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: book-info-request-authentication
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: book-info
+  jwtRules:
+  - issuer: "http://keycloak.172.19.0.6.nip.io/realms/Istio"
+    jwksUri: "http://keycloak.172.19.0.6.nip.io/realms/Istio/protocol/openid-connect/certs"
+    audiences: ["client", "api-client"] #需要參考如何在 Keycloak 中配置aud
+    forwardOriginalToken: true
+```
+
+使用指定audiences的RequestAuthentication：
+
+```sh
+❯ kubectl apply -f PeerAuthentication/request-authentication-enhanced.yaml
+```
+
+接著驗證 Greeting Service → Book Service 是否正常運作，呼叫/greeting API：
+
+```sh
+❯ curl -X GET http://greeting.172.19.0.6.nip.io/greeting
+{"id":4,"content":"Sorry, we couldn't retrieve book information at the moment. Authentication or service error occurred."}% 
+```
+
+顯示認證錯誤訊息，表示Client Credentials認證失敗，因為目前Keycloak配發的JWT Token缺少aud參數。
+
+取得目前JWT Token，複製access_token內容，貼到jwt.io網站解析：
+```sh
+❯ curl -X POST -d "client_id=client" -d "client_secret=G1ubsAhCLcwKNgE6J7oGOQtj6kRWZsYm" -d "grant_type=client_credentials" "http://keycloak.172.19.0.6.nip.io/realms/Istio/protocol/openid-connect/token"
+{"access_token":"eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJlY0VRZjNUNDhNeTVUME1jUlpIV0QxSWx1ZzlJNDNnUzlSeTFWekpER0tBIn0.eyJleHAiOjE3NTQ4OTE2MDYsImlhdCI6MTc1NDg5MTMwNiwianRpIjoidHJydGNjOjU1ODk0YTFhLTNlZmQtNmQxNy0yNDRkLWZjOWQxNGIxZDY1YSIsImlzcyI6Imh0dHA6Ly9rZXljbG9hay4xNzIuMTkuMC42Lm5pcC5pby9yZWFsbXMvSXN0aW8iLCJzdWIiOiI1MDk5ZWE0MS1mNzFiLTRjNzMtYTBhMy04ZjQyMDRiY2FjNGEiLCJ0eXAiOiJCZWFyZXIiLCJhenAiOiJjbGllbnQiLCJhY3IiOiIxIiwiYWxsb3dlZC1vcmlnaW5zIjpbIi8qIl0sInJlYWxtX2FjY2VzcyI6eyJyb2xlcyI6WyJhZG1pbiJdfSwic2NvcGUiOiJlbWFpbCBwcm9maWxlIiwiY2xpZW50SG9zdCI6IjE3Mi4xOS4wLjUiLCJlbWFpbF92ZXJpZmllZCI6ZmFsc2UsInByZWZlcnJlZF91c2VybmFtZSI6InNlcnZpY2UtYWNjb3VudC1jbGllbnQiLCJjbGllbnRBZGRyZXNzIjoiMTcyLjE5LjAuNSIsImNsaWVudF9pZCI6ImNsaWVudCJ9.Vwdu9r4XQ3GbQkCBqvCwv--RAql9OPiLe1VhUBkT2yiz0JDfwxn0CL41vGVehpPxiVJfc_mmUcbh29ZrDpnOkxrDUZy0vq09rcVZzpB3ZTHYhM3pyguJJeT-TSXE60p5fCunR2I7vr1jbKT4mgjgw2ThovPi15FqxSYshmlTv7aCoqHINQskz1IGxfyjEk2IFsqP4xg3XPpuGcXuIkN8K8MIMpSMczIa4Vp3CrMo8jKfUZVbZR1dT7WfBCdlMQOgDyeX6AouX0NCG9-nHTO5uK5Sh4Nyrw9C-Op-AcKT2JxsMxtWlIa3CDvcEG3xR176z6Jkam3Q6V8DnM6jM1cjZw","expires_in":300,"refresh_expires_in":0,"token_type":"Bearer","not-before-policy":0,"scope":"email profile"}%
+```
+
+解析發現，其中並沒有aud的欄位，見下圖：
+![](docs/images/jwtio.png)
+
+##### 創建 Audience aud 欄位
+
+因此，依照[How To Configure Audience In Keycloak](https://dev.to/metacosmos/how-to-configure-audience-in-keycloak-kp4)文章，增加Audience對應。
+
+建立自定義對應欄位
+
+- 在左側窗格中選擇"Client scope"，然後點選"Create client scope"按鈕，名稱輸入"untrusted-audience"。
+- Type選擇"Default"，接著按"Save"儲存。
+
+![](docs/images/audience1.png)
+
+- 再按下"Mappers"頁籤，按"Configure a new mapper"按鈕，選擇Audience。
+- 名稱輸入"greeting-service"，接著按"Save"儲存。
+
+![](docs/images/audience2.png)
+
+- 在左側窗格中選擇"Clients"，選擇"client"，再按下"Client scope"頁籤，按下"Add client scope"按鈕。
+- 勾選"untrusted-audience"，按下"Add"按鈕，選擇"Default"。
+
+![](docs/images/audience3.png)
+
+再次取得目前JWT Token，複製access_token內容，貼到jwt.io網站解析：
+
+```sh
+❯ curl -X POST -d "client_id=client" -d "client_secret=G1ubsAhCLcwKNgE6J7oGOQtj6kRWZsYm" -d "grant_type=client_credentials" "http://keycloak.172.19.0.6.nip.io/realms/Istio/protocol/openid-connect/token"
+{"access_token":"eyJhbGciOiJSUzI1NiIsInR5cCIgOiAiSldUIiwia2lkIiA6ICJlY0VRZjNUNDhNeTVUME1jUlpIV0QxSWx1ZzlJNDNnUzlSeTFWekpER0tBIn0.eyJleHAiOjE3NTQ4OTMxNTUsImlhdCI6MTc1NDg5Mjg1NSwianRpIjoidHJydGNjOmI2M2QwYjdiLTJmNGYtN2Y1NS1kZjBhLWE3Yjc2MThhY2EzYiIsImlzcyI6Imh0dHA6Ly9rZXljbG9hay4xNzIuMTkuMC42Lm5pcC5pby9yZWFsbXMvSXN0aW8iLCJhdWQiOiJjbGllbnQiLCJzdWIiOiI1MDk5ZWE0MS1mNzFiLTRjNzMtYTBhMy04ZjQyMDRiY2FjNGEiLCJ0eXAiOiJCZWFyZXIiLCJhenAiOiJjbGllbnQiLCJhY3IiOiIxIiwiYWxsb3dlZC1vcmlnaW5zIjpbIi8qIl0sInJlYWxtX2FjY2VzcyI6eyJyb2xlcyI6WyJhZG1pbiJdfSwic2NvcGUiOiJlbWFpbCBwcm9maWxlIiwiY2xpZW50SG9zdCI6IjEwLjI0NC4xLjEiLCJlbWFpbF92ZXJpZmllZCI6ZmFsc2UsInByZWZlcnJlZF91c2VybmFtZSI6InNlcnZpY2UtYWNjb3VudC1jbGllbnQiLCJjbGllbnRBZGRyZXNzIjoiMTAuMjQ0LjEuMSIsImNsaWVudF9pZCI6ImNsaWVudCJ9.lbfjGhgP_gk-PgfG0Rv5Me7wqaIxLpVgYmGgHmGyiAg4CRaSaAXOeTMxJ79lqe7hlbWIO6EveoxEUjlbmma-6ATjFJ31HxkW_7Wv_gzFJk38M2OQaI-QAn63lQk50OfgP1DHXuN4INbtjIEkgaxOQCzOqFILCmAtA5nXaglgEPxxWw7umSpFh2P6WWLxB-V7YmlzRS-vrgE16VL4hmnmNDDHkzx9M-jPP8BpGRqudooppWsYjGG6RJ8jOcZmX4v_bbZ_qRcIJ__YkedXMj2zDyNrdzOWYcloNyQwgPaujhkVi4UeQwtPYzXtJ9VAgfiHXcf0dL_xMIsWhLYi0r9gag","expires_in":300,"refresh_expires_in":0,"token_type":"Bearer","not-before-policy":0,"scope":"email profile"}% 
+```
+
+![](docs/images/jwtio_new.png)
+
+可看到已經有aud欄位，此時再呼叫/greeting API，可看到Greeting Service → Book Service 已恢復正常運作：
+
+```sh
+❯ curl -X GET http://greeting.172.19.0.6.nip.io/greeting
+{"id":1,"content":"Hello, authenticated Member! We have 3 books available for you."}%
+```
+
+### 3. 啟用 K8s service account 來源驗證
+
+Istio可實現細粒度授權政策，用於防止內部服務橫向惡意攻擊，以下是啟用加上service account來源驗證和Audience aud 欄位驗證的授權政策，內容為AuthorizationPolicy/authorization-policy-enhanced.yaml
+
+```yaml
+# Enhanced AuthorizationPolicy for book-info service with mTLS + JWT dual authentication
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: book-info-enhanced-auth
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: book-info
+  action: ALLOW
+  rules:
+  # Rule 1: Allow access to /getbooks with valid JWT from authenticated services
+  - from:
+    # - source:
+    #     principals: ["cluster.local/ns/default/sa/greeting-service"]
+    # - source:
+    #     requestPrincipals: ["*"]
+  # Rule 2: Allow access to /addbook only for admin role with both mTLS and JWT
+    - source:
+        principals: ["cluster.local/ns/default/sa/greeting-service"]
+        requestPrincipals: ["*"]
+    to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/getbooks", "/getbookbytitle*"]
+    when:
+    - key: request.auth.claims[aud]
+      values: ["client", "api-client"]
+  
+  # Rule 2: Allow access to /addbook only for admin role with both mTLS and JWT
+  - from:
+    - source:
+        principals: ["cluster.local/ns/default/sa/greeting-service"]
+        requestPrincipals: ["*"]
+    to:
+    - operation:
+        methods: ["POST"]
+        paths: ["/addbook*"]
+    when:
+    - key: request.auth.claims[realm_access][roles]
+      values: ["admin"]
+    - key: request.auth.claims[aud]
+      values: ["client", "api-client"]
+  
+  # Rule 3: Allow health checks without authentication (for monitoring)
+  - to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/health", "/healthz", "/actuator/health"]
+```
+
+移除舊的授權政策，並啟用細粒度授權政策：
+
+```sh
+❯ kubectl delete -f AuthorizationPolicy/authorizationPolicy2.yaml
+❯ kubectl apply -f AuthorizationPolicy/authorization-policy-enhanced.yaml
+```
+
+此時用Postman呼叫http://book-info.172.19.0.6.nip.io/getbooks，就會出現RBAC: access denied錯誤，而呼叫/greeting API也會出現認證失敗訊息：
+
+```sh
+❯ curl -X GET http://greeting.172.19.0.6.nip.io/greeting
+{"id":25,"content":"Sorry, we couldn't retrieve book information at the moment. Authentication or service error occurred."}%
+```
+
+主要原因是目前book-info服務限制使用greeting-service service account來存取，因此重新部署greeting-service，使用*AuthorizationPolicy/greeting-service-account.yaml*。
+
+```sh
+❯ kubectl apply -f AuthorizationPolicy/greeting-service-account.yaml
+serviceaccount/greeting-service created
+deployment.apps/greeting-deployment configured
+service/greeting-service unchanged
+gateway.networking.istio.io/greeting-gateway unchanged
+virtualservice.networking.istio.io/greeting-vs unchanged
+```
+
+檢查是否有帶入service account：
+
+```sh
+❯ kubectl describe deployments.apps greeting-deployment | grep Account
+  Service Account:  greeting-service
+```
+
+再次呼叫/greeting API，可看到Greeting Service → Book Service 已恢復正常運作，但是因為限定來源，Postman呼叫http://book-info.172.19.0.6.nip.io/getbooks，仍舊會出現RBAC: access denied錯誤：
+
+```sh
+❯ curl -X GET http://greeting.172.19.0.6.nip.io/greeting
+{"id":1,"content":"Hello, authenticated Member! We have 3 books available for you."}%
+```
+
+## 總結：
+
+注意事項：
+
+### 1. AuthorizationPolicy 設定邏輯
+
+```yaml
+  # Rule 1: Allow access to /getbooks with valid JWT from authenticated services
+  - from:
+    - source:
+        principals: ["cluster.local/ns/default/sa/greeting-service"]
+    - source:
+        requestPrincipals: ["*"]
+  # Rule 2: Allow access to /addbook only for admin role with both mTLS and JWT
+    - source:
+        principals: ["cluster.local/ns/default/sa/greeting-service"]
+        requestPrincipals: ["*"]
+```
+上面的Rule 1是OR條件，表示兩個source擇一即可，但這無法確保呼叫來源，Postman呼叫http://book-info.172.19.0.6.nip.io/getbooks就可存取，所以正確是Rule 2才是符合的AND條件。
+
+### 與其他方案的比較
+
+| 方案 | 入侵防護能力 | Istio整合度 | 實施複雜度 | 防護深度 |
+|------|-------------|-------------|------------|----------|
+| **純mTLS** | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐ | ⭐⭐⭐ |
+| **純JWT** | ⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐ |
+| **mTLS+JWT** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
+| **SPIFFE/SPIRE** | ⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
+
+基於本專案的實際實施經驗，mTLS + JWT 雙重認證確實是防止服務入侵橫向擴散的最佳選擇。通過正確配置 AND 邏輯、ServiceAccount 管理、JWT Audiences 控制和 Spring Boot 端口分離，可以構建一個真正安全、可靠的微服務架構。配合 Istio 的 AuthorizationPolicy，實現了毫秒級的動態威脅隔離，是企業級微服務安全的理想選擇。
 
 ## 🚀 快速開始
 

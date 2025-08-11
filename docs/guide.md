@@ -1,4 +1,41 @@
-這是一個非常實務且關鍵的安全架構問題。基於您對防止惡意程式入侵擴散的關注，我建議在Istio平台中採用**mTLS + JWT雙重認證的混合模式**，這是最有效的深度防禦策略。基於您的安全需求和Istio平台特性，我強烈建議採用**mTLS + JWT雙重認證模式**，這是目前在Istio中防止惡意擴散最有效的深度防禦策略。
+# Istio 服務網格安全防護指南
+
+本指南基於本專案的實際實施經驗，描述了在 Istio 平台中採用 **mTLS + JWT 雙重認證模式** 的完整安全架構，這是目前在 Istio 中防止惡意程式入侵擴散最有效的深度防禦策略。
+
+## 🏗️ 專案架構概述
+
+```
+┌─────────────────┐    mTLS+JWT    ┌─────────────────┐    mTLS+JWT    ┌─────────────────┐
+│   Client Apps   │ ──────────────→│  Istio Gateway  │──────────────→│ Greeting Service│
+└─────────────────┘                └─────────────────┘                │  (REST API)     │
+                                            │                        └─────────────────┘
+                                            │                                 │
+                                            ▼                                 │ mTLS+JWT
+                                   ┌─────────────────┐                        │
+                                   │    Keycloak     │                        ▼
+                                   │  (JWT Issuer)   │                ┌─────────────────┐
+                                   └─────────────────┘                │   Book Service  │
+                                                                      │  (Backend API)  │
+                                                                      └─────────────────┘
+                                                                              │
+                                                                              ▼
+                                                                      ┌─────────────────┐
+                                                                      │   MySQL DB      │
+                                                                      │  (Data Store)   │
+                                                                      └─────────────────┘
+```
+
+**服務調用流程**：
+1. **Client → Gateway**: 用戶端透過 JWT token 請求 Greeting Service
+2. **Gateway → Greeting**: Istio Gateway 路由請求到 Greeting Service (REST API 層)
+3. **Greeting → Book**: Greeting Service 透過 mTLS + JWT 雙重認證調用 Book Service
+4. **Book → MySQL**: Book Service 處理業務邏輯並存取資料庫
+
+**專案實施背景**：
+- **架構**: Spring Boot 3.5.4 + Istio Service Mesh + Keycloak + Kind Kubernetes
+- **應用場景**: 圖書管理系統的請求級身份驗證與授權
+- **核心特性**: mTLS + JWT 雙重認證、細粒度授權策略、GraalVM Native Image 支持
+- **安全特色**: 防入侵橫向擴散、Spring Boot Actuator 端口分離、JWT Audiences 控制
 
 ## 推薦方案：mTLS + JWT 雙重認證架構
 
@@ -71,6 +108,77 @@ spec:
     when:
     - key: source.ip
       values: ["10.0.0.0/8"]  # 只允許內部網路
+```
+
+### 本專案安全架構實現
+
+基於實際部署的 Greeting Service → Book Service 調用鏈安全配置：
+
+```yaml
+# 本專案實際配置 - mTLS 強制模式
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: default
+spec:
+  mtls:
+    mode: STRICT
+
+---
+# 本專案實際配置 - JWT 請求認證 (Book Service)
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: book-info-request-authentication
+spec:
+  selector:
+    matchLabels:
+      app: book-info
+  jwtRules:
+  - issuer: "http://keycloak.172.19.0.6.nip.io/realms/Istio"
+    jwksUri: "http://keycloak.172.19.0.6.nip.io/realms/Istio/protocol/openid-connect/certs"
+    audiences: ["client", "api-client"]
+
+---
+# 本專案實際配置 - 服務間調用授權策略
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: book-info-enhanced-auth
+spec:
+  selector:
+    matchLabels:
+      app: book-info
+  action: ALLOW
+  rules:
+  # 允許 Greeting Service 透過 mTLS + JWT 調用 Book Service
+  - from:
+    - source:
+        principals: ["cluster.local/ns/default/sa/greeting-service"]
+        requestPrincipals: ["*"]
+    to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/getbooks", "/getbookbytitle*"]
+    when:
+    - key: request.auth.claims[azp]
+      values: ["client", "api-client"]
+  
+  # 只有 admin 角色可以新增書籍
+  - from:
+    - source:
+        principals: ["cluster.local/ns/default/sa/greeting-service"]
+        requestPrincipals: ["*"]
+    to:
+    - operation:
+        methods: ["POST"]
+        paths: ["/addbook*"]
+    when:
+    - key: request.auth.claims[realm_access][roles]
+      values: ["admin"]
+    - key: request.auth.claims[azp]
+      values: ["client", "api-client"]
 ```
 
 ### 關鍵防護機制
@@ -166,30 +274,42 @@ spec:
 
 ### 實際部署建議
 
-**階段1：基礎mTLS啟用**（1-2週）
+**階段1：基礎環境準備**（1週）
 ```bash
-# 全網格啟用嚴格mTLS
-kubectl apply -f - <<EOF
-apiVersion: security.istio.io/v1
-kind: PeerAuthentication
-metadata:
-  name: default
-  namespace: istio-system
-spec:
-  mtls:
-    mode: STRICT
-EOF
+# 建立 Kind 集群
+kind create cluster --config istio-keycloak/kind.yml
+
+# 安裝 Istio
+istioctl install --set profile=demo -y
 ```
 
-**階段2：JWT層實施**（2-4週）
-- 部署身份服務器（如Keycloak、Auth0）
-- 配置RequestAuthentication政策
-- 實施JWT token管理機制
+**階段2：應用與身份服務部署**（1-2週）
+```bash
+# 部署 MySQL 資料庫
+kubectl apply -f istio-keycloak/app/database.yaml
 
-**階段3：細粒度授權**（4-6週）
-- 部署基於claims的AuthorizationPolicy
-- 實施最小權限原則
-- 建立威脅檢測機制
+# 部署 Book Service (Backend API)
+kubectl apply -f istio-keycloak/app/app.yaml
+
+# 部署 Greeting Service (REST API 層)
+kubectl apply -f AuthorizationPolicy/greeting-service-account.yaml
+
+# 部署 Keycloak (Identity Provider)
+kubectl apply -f keycloak/keycloak.yaml
+kubectl apply -f keycloak/keycloak-gateway.yaml
+```
+
+**階段3：安全策略實施**（1-2週）
+```bash
+# 啟用 mTLS
+kubectl apply -f PeerAuthentication/
+
+# 配置 JWT 認證
+kubectl apply -f istio-keycloak/istio-manifests/requestAuthentication.yaml
+
+# 部署授權策略
+kubectl apply -f istio-keycloak/istio-manifests/authorizationPolicy.yaml
+```
 
 **監控與應急響應**
 ```yaml
@@ -212,4 +332,134 @@ spec:
           value: "%{REQUEST_AUTH_CLAIMS}"
 ```
 
-**總結**：在Istio環境中，mTLS + JWT雙重認證是防止服務入侵橫向擴散的最佳選擇。這種組合確保即使單一服務被入侵，攻擊者也無法輕易存取其他服務，因為需要同時滿足傳輸層身份驗證（mTLS）和應用層授權（JWT）的雙重要求。配合Istio的AuthorizationPolicy，可以實現毫秒級的動態威脅隔離，是企業級微服務安全的理想選擇。
+## 專案實際部署經驗
+
+### 關鍵配置文件
+
+基於本專案的實施，以下是核心配置：
+
+```yaml
+# PeerAuthentication - 強制 mTLS
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: default
+spec:
+  mtls:
+    mode: STRICT
+```
+
+```yaml
+# RequestAuthentication - JWT 驗證
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: book-info-request-authentication
+spec:
+  selector:
+    matchLabels:
+      app: book-info
+  jwtRules:
+  - issuer: "http://keycloak.172.19.0.6.nip.io/realms/Istio"
+    jwksUri: "http://keycloak.172.19.0.6.nip.io/realms/Istio/protocol/openid-connect/certs"
+    audiences: ["client", "api-client"]
+```
+
+### 實際遇到的問題與解決方案
+
+#### 1. AuthorizationPolicy OR 邏輯安全漏洞
+
+**問題**：發現了嚴重的安全問題，OR 邏輯導致 JWT-only 請求被允許通過
+
+**解決方案**：修改為 AND 邏輯，確保同時需要 mTLS 和 JWT 認證
+
+#### 2. Spring Boot Actuator 健康檢查衝突
+
+**問題**：Actuator 端點被 OAuth2 安全配置阻擋，導致應用 CrashLoopBackOff
+
+**解決方案**：將 Actuator 分離到獨立端口 9000
+
+```properties
+management.server.port=9000
+```
+
+#### 3. ServiceAccount 名稱不匹配
+
+**問題**：AuthorizationPolicy 引用的 ServiceAccount 不存在
+
+**解決方案**：確保 ServiceAccount 名稱與 Deployment 中的 serviceAccountName 一致
+
+### GraalVM Native Image 支持
+
+本專案已配置 GraalVM Native Image 支持，實現更輕量的容器鏡像：
+
+```xml
+<profile>
+  <id>native</id>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <configuration>
+          <image>
+            <builder>paketobuildpacks/builder-jammy-buildpackless-tiny</builder>
+            <buildpacks>
+              <buildpack>paketobuildpacks/oracle</buildpack>
+              <buildpack>paketobuildpacks/java-native-image</buildpack>
+            </buildpacks>
+          </image>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</profile>
+```
+
+### JWT Audiences 安全控制
+
+**重要發現**：`audiences` 參數是防止 token 濫用的關鍵安全控制
+
+```yaml
+audiences: ["client", "api-client"]  # 限制 token 使用範圍
+```
+
+如果省略此參數，將導致任何來自同一 Issuer 的 JWT 都能通過驗證，增加橫向攻擊風險。
+
+## 部署指令參考
+
+```bash
+# 1. 部署基礎設施
+kind create cluster --config kind.yml
+istioctl install --set profile=demo -y
+
+# 2. 部署應用
+kubectl apply -f istio-keycloak/app/database.yaml
+kubectl apply -f istio-keycloak/app/app.yaml
+
+# 3. 配置安全策略
+kubectl apply -f authorization-policy-enhanced.yaml
+kubectl apply -f PeerAuthentication/request-authentication-enhanced.yaml
+
+# 4. 部署 ServiceAccount
+kubectl apply -f greeting-service-account.yaml
+
+# 5. Native Image 建置
+./mvnw spring-boot:build-image -Pnative -DskipTests
+```
+
+## 監控與驗證
+
+```bash
+# 檢查 mTLS 狀態
+istioctl proxy-status
+
+# 驗證 JWT 配置
+istioctl proxy-config listeners <pod-name> --port 15006
+
+# 檢查授權決策
+kubectl logs -l app=istiod -n istio-system | grep authorization
+```
+
+**總結**：基於本專案的實際實施經驗，mTLS + JWT 雙重認證確實是防止服務入侵橫向擴散的最佳選擇。通過正確配置 AND 邏輯、ServiceAccount 管理、JWT Audiences 控制和 Spring Boot 端口分離，可以構建一個真正安全、可靠的微服務架構。配合 Istio 的 AuthorizationPolicy，實現了毫秒級的動態威脅隔離，是企業級微服務安全的理想選擇。

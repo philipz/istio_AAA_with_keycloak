@@ -26,7 +26,7 @@ spec:
         methods: ["GET"]
         paths: ["/getbooks", "/getbookbytitle*"]
     when:
-    - key: request.auth.claims[azp]
+    - key: request.auth.claims[aud]
       values: ["client", "api-client"]
   
   # Rule 2: Allow access to /addbook only for admin role with both mTLS and JWT
@@ -41,7 +41,7 @@ spec:
     when:
     - key: request.auth.claims[realm_access][roles]
       values: ["admin"]
-    - key: request.auth.claims[azp]
+    - key: request.auth.claims[aud]
       values: ["client", "api-client"]
   
   # Rule 3: Allow health checks without authentication (for monitoring)
