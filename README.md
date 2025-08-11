@@ -565,7 +565,7 @@ Istio 的請求身份驗證和授權功能與 Keycloak 一起為您的應用程�
 ```
 
 **服務調用流程**：
-1. **Client → Gateway**: 用戶端可直接或透過 JWT token 請求 Greeting Service
+1. **Client → Gateway**: 用戶端可直接或透過 JWT token 請求 Greeting Service(authorization-policy-enhanced.yaml修改其註解53~98行，就可啟用Greeting的JWT授權政策)
 2. **Gateway → Greeting**: Istio Gateway 路由請求到 Greeting Service (REST API 層)
 3. **Greeting → Book**: Greeting Service 透過 mTLS + JWT 雙重認證調用 Book Service
 4. **Book → MySQL**: Book Service 處理業務邏輯並存取資料庫

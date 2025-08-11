@@ -51,6 +51,22 @@ spec:
         paths: ["/health", "/healthz", "/actuator/health"]
 
 ---
+# # RequestAuthentication for greeting-service
+# apiVersion: security.istio.io/v1
+# kind: RequestAuthentication
+# metadata:
+#   name: greeting-request-authentication
+#   namespace: default
+# spec:
+#   selector:
+#     matchLabels:
+#       app: greeting
+#   jwtRules:
+#   - audiences: ["client", "api-client"]
+#     issuer: "http://keycloak.172.19.0.6.nip.io/realms/Istio"
+#     jwksUri: "http://keycloak.172.19.0.6.nip.io/realms/Istio/protocol/openid-connect/certs"
+#     forwardOriginalToken: true
+---
 # # AuthorizationPolicy for greeting-service
 # apiVersion: security.istio.io/v1
 # kind: AuthorizationPolicy
@@ -60,15 +76,20 @@ spec:
 # spec:
 #   selector:
 #     matchLabels:
-#       app: greeting-service
+#       app: greeting
 #   action: ALLOW
 #   rules:
-#   # Allow public access to greeting endpoint
-#   - to:
+#   # Allow access to /greeting endpoint with valid JWT
+#   - from:
+#     - source:
+#         requestPrincipals: ["*"]
+#     to:
 #     - operation:
 #         methods: ["GET"]
 #         paths: ["/greeting"]
-  
+#     when:
+#     - key: request.auth.claims[aud]
+#       values: ["client", "api-client"]
 #   # Allow health checks
 #   - to:
 #     - operation:
